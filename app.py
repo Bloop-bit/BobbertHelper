@@ -116,7 +116,6 @@ def read_xlsx_full(file_path: str, text_col: Optional[str] = None, id_col: Optio
         if text_col_name is None or text_col_name not in df.columns:
             continue
         
-        # Добавляем уникальный идентификатор для каждой строки
         df['_source'] = f"{os.path.basename(file_path)}, лист {sheet.title}, строка "
         df['_row_num'] = range(1, len(df) + 1)
         df['_full_source'] = df['_source'] + df['_row_num'].astype(str)
@@ -373,7 +372,7 @@ def enrich_with_characteristics(pairs: list, llm, enable_thinking: bool = False)
     return triples
 
 # =============================================
-# 8. ОСНОВНОЙ ПАЙПЛАЙН (исправленный)
+# 8. ОСНОВНОЙ ПАЙПЛАЙН
 # =============================================
 def run_pipeline(folder: str, model: str, api_key: str,
                  text_col: Optional[str] = None, id_col: Optional[str] = None,
@@ -386,7 +385,7 @@ def run_pipeline(folder: str, model: str, api_key: str,
     )
     
     if not records:
-        return None, None, None, None
+        return None, None, None, None, None
 
     all_pairs = []
     for rec in records:
@@ -404,18 +403,29 @@ def run_pipeline(folder: str, model: str, api_key: str,
             })
 
     if not all_pairs:
-        return full_df, [], [], None
+        return full_df, [], [], None, None
 
-    pair_list = [(p['term'], p['value']) for p in all_pairs]
+    # Собираем уникальные пары для получения характеристик
+    unique_pairs = list(set((p['term'], p['value']) for p in all_pairs))
+    pair_list = [(term, value) for term, value in unique_pairs]
     triples = enrich_with_characteristics(pair_list, llm, enable_thinking=enable_thinking)
+    
+    # Создаём словарь для быстрого поиска характеристики
+    char_dict = {}
+    for term, char, value in triples:
+        char_dict[(term, value)] = char
 
-    # Создаём признаковую матрицу с привязкой по source
+    # Обогащаем all_pairs характеристиками
+    for p in all_pairs:
+        p['characteristic'] = char_dict.get((p['term'], p['value']), 'характеристика')
+
+    # Создаём признаковую матрицу
     term_features = {}
-    for (t, c, v), p in zip(triples, all_pairs):
-        feature_name = f"{t}_{c}"
+    for p in all_pairs:
+        feature_name = f"{p['term']}_{p['characteristic']}"
         if feature_name not in term_features:
             term_features[feature_name] = {}
-        term_features[feature_name][p['source']] = v
+        term_features[feature_name][p['source']] = p['value']
 
     # Создаём DataFrame признаков
     feature_df = pd.DataFrame.from_dict(term_features, orient='index').T
@@ -437,10 +447,56 @@ def run_pipeline(folder: str, model: str, api_key: str,
         if col in result_df.columns:
             result_df = result_df.drop(columns=[col])
 
-    return result_df, records, all_pairs, triples
+    return result_df, records, all_pairs, triples, feature_df
 
 # =============================================
-# 9. STREAMLIT ИНТЕРФЕЙС
+# 9. ФУНКЦИЯ ДЛЯ ПРЕОБРАЗОВАНИЯ В БИНАРНЫЙ ДАТАСЕТ
+# =============================================
+def create_binary_dataset(result_df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """
+    Преобразует текстовые значения (присутствует/отсутствует) в бинарные (1/0)
+    """
+    binary_df = result_df.copy()
+    
+    # Список слов, означающих "присутствует"
+    present_keywords = ['присутствует', 'имеется', 'есть', 'выявлен', 'обнаружен', 'положительный', 'да', 'yes']
+    # Список слов, означающих "отсутствует"
+    absent_keywords = ['отсутствует', 'нет', 'не выявлен', 'не обнаружен', 'отрицательный', 'no']
+    
+    # Словарь для маппинга значений
+    value_map = {}
+    
+    # Добавляем все возможные варианты
+    for word in present_keywords:
+        value_map[word] = 1
+    for word in absent_keywords:
+        value_map[word] = 0
+    
+    # Также обрабатываем числовые значения и другие текстовые
+    for col in feature_cols:
+        if col in binary_df.columns:
+            # Применяем маппинг
+            binary_df[col] = binary_df[col].map(value_map)
+            
+            # Если остались NaN или пустые строки, заполняем 0
+            binary_df[col] = binary_df[col].fillna(0)
+            
+            # Если остались текстовые значения, пытаемся преобразовать
+            # Если значение содержит 'присутствует' или похожее - 1, иначе 0
+            mask = binary_df[col].apply(lambda x: isinstance(x, str) and any(kw in x.lower() for kw in present_keywords))
+            binary_df.loc[mask, col] = 1
+            
+            # Если значение содержит 'отсутствует' или похожее - 0
+            mask = binary_df[col].apply(lambda x: isinstance(x, str) and any(kw in x.lower() for kw in absent_keywords))
+            binary_df.loc[mask, col] = 0
+            
+            # Преобразуем в int
+            binary_df[col] = pd.to_numeric(binary_df[col], errors='coerce').fillna(0).astype(int)
+    
+    return binary_df
+
+# =============================================
+# 10. STREAMLIT ИНТЕРФЕЙС
 # =============================================
 st.set_page_config(page_title="Медицинский парсер", layout="centered")
 st.title("🏥 Преобразование медицинских записей в датасет")
@@ -513,7 +569,7 @@ if st.button("Обработать"):
 
         with st.spinner("Идёт обработка... Это может занять несколько минут."):
             try:
-                result_df, records, all_pairs, triples = run_pipeline(
+                result_df, records, all_pairs, triples, feature_df = run_pipeline(
                     folder="input",
                     model="Qwen/Qwen3-30B-A3B",
                     api_key=api_key_input,
@@ -525,16 +581,63 @@ if st.button("Обработать"):
                 if result_df is None or result_df.empty:
                     st.error("Не удалось загрузить данные. Проверьте формат файлов.")
                 else:
+                    # Определяем колонки-признаки
+                    feature_cols = [col for col in result_df.columns if col not in ['PersonID_Ref', 'Sex', 'AGE', 'Death', 'TARGET', 'ServiceID', 'ServiceCode', 'ServiceName', 'StartDate', 'EndDate', 'CardMKB', 'MCardMKB', 'MKBCode_Ref', 'PropertyID_Ref', 'PropertyName', 'NormDescription', 'MinNormPropertyValue', 'MaxNormPropertyValue', 'MeasureID_Ref']]
+                    
+                    # Создаём бинарный датасет
+                    binary_df = create_binary_dataset(result_df, feature_cols)
+                    
+                    # Переименовываем колонки-признаки (убираем суффиксы, добавляем пометку)
+                    new_columns = {}
+                    for col in binary_df.columns:
+                        if col in feature_cols:
+                            # Убираем суффикс после последнего подчёркивания
+                            parts = col.rsplit('_', 1)
+                            if len(parts) == 2:
+                                # Если часть после подчёркивания — характеристика, убираем её
+                                # Оставляем только название термина
+                                term_name = parts[0]
+                                new_columns[col] = f"{term_name} (0 - отсутствует, 1 - присутствует)"
+                            else:
+                                new_columns[col] = f"{col} (0 - отсутствует, 1 - присутствует)"
+                        else:
+                            new_columns[col] = col
+                    
+                    binary_df = binary_df.rename(columns=new_columns)
+                    
+                    # Переставляем колонки: сначала исходные, потом признаки
+                    original_cols = [col for col in binary_df.columns if ' (0 - отсутствует, 1 - присутствует)' not in col]
+                    feature_cols_renamed = [col for col in binary_df.columns if ' (0 - отсутствует, 1 - присутствует)' in col]
+                    binary_df = binary_df[original_cols + feature_cols_renamed]
+                    
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        result_df.to_excel(writer, sheet_name='Результат', index=False)
+                        # Страница 1: Исходные записи
+                        if records:
+                            pd.DataFrame(records).to_excel(writer, sheet_name='Исходные записи', index=False)
+                        
+                        # Страница 2: Пары
                         if all_pairs:
-                            pd.DataFrame(all_pairs).to_excel(writer, sheet_name='Извлеченные пары', index=False)
+                            pd.DataFrame(all_pairs).to_excel(writer, sheet_name='Пары', index=False)
+                        
+                        # Страница 3: Тройки
                         if triples:
                             pd.DataFrame(triples, columns=['Термин', 'Характеристика', 'Значение']).to_excel(writer, sheet_name='Тройки', index=False)
+                        
+                        # Страница 4: Словарь характеристик
+                        if all_pairs:
+                            char_dict = {}
+                            for p in all_pairs:
+                                char_dict[p['value']] = p.get('characteristic', 'характеристика')
+                            df_char = pd.DataFrame(list(char_dict.items()), columns=['Значение', 'Характеристика'])
+                            df_char.to_excel(writer, sheet_name='Словарь характеристик', index=False)
+                        
+                        # Страница 5: Конечный датасет (бинарный)
+                        binary_df.to_excel(writer, sheet_name='Конечный датасет', index=False)
+                    
                     output.seek(0)
 
-                    st.success(f"Обработка завершена! Исходная колонка заменена на {len(result_df.columns)} колонок-признаков.")
+                    st.success(f"Обработка завершена! Создано {len(binary_df.columns)} колонок в конечном датасете.")
                     st.download_button(
                         label="📥 Скачать результат.xlsx",
                         data=output,
