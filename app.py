@@ -232,10 +232,10 @@ def load_folder_full(folder_path: str, text_col: Optional[str] = None, id_col: O
     return all_records, full_df, text_col_name, id_col_name
 
 # =============================================
-# 5. АДАПТЕР ДЛЯ CLOUD.RU (Qwen3.5-9B)
+# 5. АДАПТЕР ДЛЯ CLOUD.RU (Qwen3-30B-A3B)
 # =============================================
 class CloudRuAdapter:
-    def __init__(self, model: str = "Qwen/Qwen3.5-9B", api_key: str = None, timeout: int = 300):
+    def __init__(self, model: str = "Qwen/Qwen3-30B-A3B", api_key: str = None, timeout: int = 300):
         self.model = model
         self.api_key = api_key
         if not self.api_key:
@@ -506,7 +506,7 @@ if st.button("Обработать"):
             try:
                 result_df, records, all_pairs, triples = run_pipeline(
                     folder="input",
-                    model="Qwen/Qwen3.5-9B",  # <-- НОВАЯ МОДЕЛЬ
+                    model="Qwen/Qwen3-30B-A3B",  # <-- ВОЗВРАЩАЕМ СТАРУЮ МОДЕЛЬ
                     api_key=api_key_input,
                     text_col=text_col,
                     id_col=id_col,
