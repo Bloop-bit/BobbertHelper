@@ -116,15 +116,20 @@ def read_xlsx_full(file_path: str, text_col: Optional[str] = None, id_col: Optio
         if text_col_name is None or text_col_name not in df.columns:
             continue
         
+        # Добавляем уникальный идентификатор для каждой строки
+        df['_source'] = f"{os.path.basename(file_path)}, лист {sheet.title}, строка "
+        df['_row_num'] = range(1, len(df) + 1)
+        df['_full_source'] = df['_source'] + df['_row_num'].astype(str)
+        
         for idx, row in df.iterrows():
             text = str(row[text_col_name]) if pd.notna(row[text_col_name]) else ""
             if text.strip():
                 patient_id = str(row[id_col_name]) if id_col_name and id_col_name in df.columns and pd.notna(row[id_col_name]) else None
                 all_records.append({
-                    'row_num': idx + 1,
+                    'source': row['_full_source'],
                     'text': text.strip(),
-                    'source': f"{os.path.basename(file_path)}, лист {sheet.title}, строка {idx+1}",
-                    'patient_id': patient_id
+                    'patient_id': patient_id,
+                    'row_data': row.to_dict()
                 })
         
         full_dfs.append(df)
@@ -168,16 +173,21 @@ def read_docx_full(file_path: str, text_col: Optional[str] = None, id_col: Optio
             
             text = row_data.get(text_col_name, "")
             if text.strip():
+                source = f"{os.path.basename(file_path)}, строка {row_counter}"
                 patient_id = row_data.get(id_col_name) if id_col_name else None
                 records.append({
-                    'row_num': row_counter,
+                    'source': source,
                     'text': text.strip(),
-                    'source': f"{os.path.basename(file_path)}, строка {row_counter}",
-                    'patient_id': patient_id
+                    'patient_id': patient_id,
+                    'row_data': row_data
                 })
         
         if rows_data:
-            full_dfs.append(pd.DataFrame(rows_data))
+            df = pd.DataFrame(rows_data)
+            df['_source'] = f"{os.path.basename(file_path)}, строка "
+            df['_row_num'] = range(1, len(df) + 1)
+            df['_full_source'] = df['_source'] + df['_row_num'].astype(str)
+            full_dfs.append(df)
     
     full_df = pd.concat(full_dfs, ignore_index=True) if full_dfs else pd.DataFrame()
     return records, full_df, text_col_name, id_col_name
@@ -189,13 +199,15 @@ def read_txt_full(file_path: str) -> tuple:
     for i, line in enumerate(lines, 1):
         text = line.strip()
         if text:
+            source = f"{os.path.basename(file_path)}, строка {i}"
             records.append({
-                'row_num': i,
+                'source': source,
                 'text': text,
-                'source': f"{os.path.basename(file_path)}, строка {i}",
-                'patient_id': None
+                'patient_id': None,
+                'row_data': {'text': text}
             })
-    return records, pd.DataFrame(), None, None
+    full_df = pd.DataFrame([r['row_data'] for r in records]) if records else pd.DataFrame()
+    return records, full_df, None, None
 
 def detect_file_type(file_path: str) -> Optional[str]:
     ext = os.path.splitext(file_path)[1].lower()
@@ -232,7 +244,7 @@ def load_folder_full(folder_path: str, text_col: Optional[str] = None, id_col: O
     return all_records, full_df, text_col_name, id_col_name
 
 # =============================================
-# 5. АДАПТЕР ДЛЯ CLOUD.RU (Qwen3-30B-A3B)
+# 5. АДАПТЕР ДЛЯ CLOUD.RU
 # =============================================
 class CloudRuAdapter:
     def __init__(self, model: str = "Qwen/Qwen3-30B-A3B", api_key: str = None, timeout: int = 300):
@@ -361,7 +373,7 @@ def enrich_with_characteristics(pairs: list, llm, enable_thinking: bool = False)
     return triples
 
 # =============================================
-# 8. ОСНОВНОЙ ПАЙПЛАЙН
+# 8. ОСНОВНОЙ ПАЙПЛАЙН (исправленный)
 # =============================================
 def run_pipeline(folder: str, model: str, api_key: str,
                  text_col: Optional[str] = None, id_col: Optional[str] = None,
@@ -388,8 +400,7 @@ def run_pipeline(folder: str, model: str, api_key: str,
                 'value': v,
                 'source': rec['source'],
                 'source_text': rec['text'],
-                'patient_id': rec.get('patient_id'),
-                'row_num': rec.get('row_num')
+                'patient_id': rec.get('patient_id')
             })
 
     if not all_pairs:
@@ -398,33 +409,33 @@ def run_pipeline(folder: str, model: str, api_key: str,
     pair_list = [(p['term'], p['value']) for p in all_pairs]
     triples = enrich_with_characteristics(pair_list, llm, enable_thinking=enable_thinking)
 
-    # Создаём признаковую матрицу
+    # Создаём признаковую матрицу с привязкой по source
     term_features = {}
     for (t, c, v), p in zip(triples, all_pairs):
         feature_name = f"{t}_{c}"
         if feature_name not in term_features:
             term_features[feature_name] = {}
-        row_key = p.get('row_num') or p.get('source')
-        term_features[feature_name][row_key] = v
+        term_features[feature_name][p['source']] = v
 
-    feature_df = pd.DataFrame()
-    for feature_name, values in term_features.items():
-        feature_df[feature_name] = pd.Series(values)
-
+    # Создаём DataFrame признаков
+    feature_df = pd.DataFrame.from_dict(term_features, orient='index').T
+    feature_df = feature_df.fillna("")
+    
+    # Добавляем признаки в full_df
     result_df = full_df.copy()
     
+    # Удаляем колонку с текстом
     if text_col_name and text_col_name in result_df.columns:
         result_df = result_df.drop(columns=[text_col_name])
     
+    # Добавляем признаки по source
     for feature_name in feature_df.columns:
-        result_df[feature_name] = None
-        for idx, row in result_df.iterrows():
-            for rec in records:
-                if rec.get('row_num') == idx + 1:
-                    source_key = rec.get('row_num') or rec.get('source')
-                    if source_key in feature_df[feature_name].index:
-                        result_df.at[idx, feature_name] = feature_df[feature_name][source_key]
-                    break
+        result_df[feature_name] = result_df['_full_source'].map(feature_df[feature_name]).fillna("")
+    
+    # Удаляем служебные колонки
+    for col in ['_source', '_row_num', '_full_source']:
+        if col in result_df.columns:
+            result_df = result_df.drop(columns=[col])
 
     return result_df, records, all_pairs, triples
 
@@ -435,14 +446,12 @@ st.set_page_config(page_title="Медицинский парсер", layout="cen
 st.title("🏥 Преобразование медицинских записей в датасет")
 st.markdown("Загрузите файлы (Excel, Word, TXT). Исходная колонка с текстом будет заменена на извлечённые признаки.")
 
-# API-ключ
 if CLOUD_RU_API_KEY:
     api_key_input = CLOUD_RU_API_KEY
     st.success("🔑 API-ключ загружен из секретов")
 else:
     api_key_input = st.text_input("Введите ваш API-ключ Cloud.ru", type="password")
 
-# Загрузка файлов
 uploaded_files = st.file_uploader(
     "Выберите файлы",
     accept_multiple_files=True,
@@ -506,7 +515,7 @@ if st.button("Обработать"):
             try:
                 result_df, records, all_pairs, triples = run_pipeline(
                     folder="input",
-                    model="Qwen/Qwen3-30B-A3B",  # <-- ВОЗВРАЩАЕМ СТАРУЮ МОДЕЛЬ
+                    model="Qwen/Qwen3-30B-A3B",
                     api_key=api_key_input,
                     text_col=text_col,
                     id_col=id_col,
