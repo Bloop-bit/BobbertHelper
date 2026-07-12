@@ -1,5 +1,5 @@
 # =============================================
-# 0. УСТАНОВКА КОДИРОВКИ UTF-8 (безопасно)
+# 0. УСТАНОВКА КОДИРОВКИ UTF-8
 # =============================================
 import os
 import sys
@@ -86,51 +86,22 @@ def detect_id_column(headers: List[str], df_sample: pd.DataFrame, text_col: Opti
     return None
 
 # =============================================
-# 4. ФУНКЦИИ ЧТЕНИЯ ФАЙЛОВ
+# 4. ФУНКЦИИ ЧТЕНИЯ ФАЙЛОВ (сохраняем все колонки)
 # =============================================
-def read_docx(file_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> List[Dict]:
-    doc = Document(file_path)
-    records = []
-    row_counter = 0
-    for table in doc.tables:
-        if not table.rows:
-            continue
-        headers = [cell.text.strip() for cell in table.rows[0].cells]
-        if text_col is None:
-            sample_rows = []
-            for row in table.rows[1:11]:
-                sample_rows.append([cell.text.strip() for cell in row.cells])
-            if headers and sample_rows:
-                df_sample = pd.DataFrame(sample_rows, columns=headers)
-                text_col = detect_text_column(headers, df_sample)
-                id_col = detect_id_column(headers, df_sample, text_col)
-            else:
-                continue
-        if text_col is None or text_col not in headers:
-            continue
-        text_idx = headers.index(text_col)
-        id_idx = headers.index(id_col) if id_col and id_col in headers else None
-        for row in table.rows[1:]:
-            row_counter += 1
-            cells = row.cells
-            if text_idx < len(cells):
-                text = cells[text_idx].text.strip()
-                if text:
-                    patient_id = None
-                    if id_idx is not None and id_idx < len(cells):
-                        patient_id = cells[id_idx].text.strip() or None
-                    records.append({
-                        'row_num': row_counter,
-                        'text': text,
-                        'source': f"{os.path.basename(file_path)}, строка {row_counter}",
-                        'patient_id': patient_id
-                    })
-    return records
-
-def read_xlsx(file_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> List[Dict]:
+def read_xlsx_full(file_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> tuple:
+    """
+    Читает xlsx, возвращает:
+    - records: список записей с текстом и patient_id
+    - full_df: полный DataFrame с исходными данными
+    - text_col_name: имя колонки с текстом
+    - id_col_name: имя колонки с ID
+    """
     wb = load_workbook(file_path, data_only=True)
-    records = []
-    row_counter = 0
+    all_records = []
+    full_dfs = []
+    text_col_name = text_col
+    id_col_name = id_col
+    
     for sheet in wb.worksheets:
         data = sheet.values
         headers = None
@@ -142,31 +113,89 @@ def read_xlsx(file_path: str, text_col: Optional[str] = None, id_col: Optional[s
                 rows_data.append(row)
         if not headers:
             continue
-        if text_col is None:
-            df_sample = pd.DataFrame(rows_data[:100], columns=headers)
-            text_col = detect_text_column(headers, df_sample)
-            id_col = detect_id_column(headers, df_sample, text_col)
-        if text_col is None or text_col not in headers:
+        
+        # Создаём DataFrame для этого листа
+        df = pd.DataFrame(rows_data, columns=headers)
+        
+        # Определяем колонки, если не переданы
+        if text_col_name is None:
+            text_col_name = detect_text_column(headers, df.head(100))
+            id_col_name = detect_id_column(headers, df.head(100), text_col_name)
+        
+        if text_col_name is None or text_col_name not in df.columns:
             continue
-        text_idx = headers.index(text_col)
-        id_idx = headers.index(id_col) if id_col and id_col in headers else None
-        for row in rows_data:
-            row_counter += 1
-            if len(row) > text_idx:
-                text = str(row[text_idx]) if row[text_idx] is not None else ""
-                if text.strip():
-                    patient_id = None
-                    if id_idx is not None and len(row) > id_idx and row[id_idx] is not None:
-                        patient_id = str(row[id_idx])
-                    records.append({
-                        'row_num': row_counter,
-                        'text': text.strip(),
-                        'source': f"{os.path.basename(file_path)}, лист {sheet.title}, строка {row_counter}",
-                        'patient_id': patient_id
-                    })
-    return records
+        
+        # Сохраняем записи с текстом и ID
+        for idx, row in df.iterrows():
+            text = str(row[text_col_name]) if pd.notna(row[text_col_name]) else ""
+            if text.strip():
+                patient_id = str(row[id_col_name]) if id_col_name and id_col_name in df.columns and pd.notna(row[id_col_name]) else None
+                all_records.append({
+                    'row_num': idx + 1,
+                    'text': text.strip(),
+                    'source': f"{os.path.basename(file_path)}, лист {sheet.title}, строка {idx+1}",
+                    'patient_id': patient_id
+                })
+        
+        full_dfs.append(df)
+    
+    # Объединяем все листы
+    full_df = pd.concat(full_dfs, ignore_index=True) if full_dfs else pd.DataFrame()
+    return all_records, full_df, text_col_name, id_col_name
 
-def read_txt(file_path: str) -> List[Dict]:
+def read_docx_full(file_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> tuple:
+    doc = Document(file_path)
+    records = []
+    row_counter = 0
+    full_dfs = []
+    text_col_name = text_col
+    id_col_name = id_col
+    
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        headers = [cell.text.strip() for cell in table.rows[0].cells]
+        
+        if text_col_name is None:
+            sample_rows = []
+            for row in table.rows[1:11]:
+                sample_rows.append([cell.text.strip() for cell in row.cells])
+            if headers and sample_rows:
+                df_sample = pd.DataFrame(sample_rows, columns=headers)
+                text_col_name = detect_text_column(headers, df_sample)
+                id_col_name = detect_id_column(headers, df_sample, text_col_name)
+            else:
+                continue
+        
+        if text_col_name is None or text_col_name not in headers:
+            continue
+        
+        # Собираем данные таблицы
+        rows_data = []
+        for row in table.rows[1:]:
+            row_counter += 1
+            cells = row.cells
+            row_data = {headers[i]: cells[i].text.strip() if i < len(cells) else "" for i in range(len(headers))}
+            rows_data.append(row_data)
+            
+            # Запись с текстом
+            text = row_data.get(text_col_name, "")
+            if text.strip():
+                patient_id = row_data.get(id_col_name) if id_col_name else None
+                records.append({
+                    'row_num': row_counter,
+                    'text': text.strip(),
+                    'source': f"{os.path.basename(file_path)}, строка {row_counter}",
+                    'patient_id': patient_id
+                })
+        
+        if rows_data:
+            full_dfs.append(pd.DataFrame(rows_data))
+    
+    full_df = pd.concat(full_dfs, ignore_index=True) if full_dfs else pd.DataFrame()
+    return records, full_df, text_col_name, id_col_name
+
+def read_txt_full(file_path: str) -> tuple:
     with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     records = []
@@ -179,7 +208,7 @@ def read_txt(file_path: str) -> List[Dict]:
                 'source': f"{os.path.basename(file_path)}, строка {i}",
                 'patient_id': None
             })
-    return records
+    return records, pd.DataFrame(), None, None
 
 def detect_file_type(file_path: str) -> Optional[str]:
     ext = os.path.splitext(file_path)[1].lower()
@@ -188,22 +217,42 @@ def detect_file_type(file_path: str) -> Optional[str]:
     elif ext == '.txt': return 'txt'
     return None
 
-def load_folder(folder_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> List[Dict]:
+def load_folder_full(folder_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> tuple:
+    """
+    Загружает все файлы из папки, возвращает:
+    - all_records: список записей с текстом
+    - full_df: объединённый DataFrame со всеми исходными данными
+    - text_col_name: имя колонки с текстом
+    - id_col_name: имя колонки с ID
+    """
     os.makedirs(folder_path, exist_ok=True)
     all_records = []
+    all_dfs = []
+    text_col_name = text_col
+    id_col_name = id_col
+    
     for filename in os.listdir(folder_path):
         file_path = os.path.join(folder_path, filename)
         ft = detect_file_type(file_path)
+        records = []
+        df = pd.DataFrame()
+        
         if ft == 'docx':
-            all_records.extend(read_docx(file_path, text_col, id_col))
+            records, df, text_col_name, id_col_name = read_docx_full(file_path, text_col_name, id_col_name)
         elif ft == 'xlsx':
-            all_records.extend(read_xlsx(file_path, text_col, id_col))
+            records, df, text_col_name, id_col_name = read_xlsx_full(file_path, text_col_name, id_col_name)
         elif ft == 'txt':
-            all_records.extend(read_txt(file_path))
-    return all_records
+            records, df, _, _ = read_txt_full(file_path)
+        
+        all_records.extend(records)
+        if not df.empty:
+            all_dfs.append(df)
+    
+    full_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+    return all_records, full_df, text_col_name, id_col_name
 
 # =============================================
-# 5. АДАПТЕР ДЛЯ CLOUD.RU (с поддержкой thinking mode)
+# 5. АДАПТЕР ДЛЯ CLOUD.RU
 # =============================================
 class CloudRuAdapter:
     def __init__(self, model: str = "Qwen/Qwen3-30B-A3B", api_key: str = None, timeout: int = 300):
@@ -247,7 +296,7 @@ class CloudRuAdapter:
         return response.choices[0].message.content
 
 # =============================================
-# 6. ИЗВЛЕЧЕНИЕ ПАР (термин → значение)
+# 6. ИЗВЛЕЧЕНИЕ ПАР
 # =============================================
 def extract_pairs(text: str, llm, enable_thinking: bool = False) -> list:
     if len(text) > 1500:
@@ -332,7 +381,7 @@ def enrich_with_characteristics(pairs: list, llm, enable_thinking: bool = False)
     return triples
 
 # =============================================
-# 8. ОСНОВНОЙ ПАЙПЛАЙН
+# 8. ОСНОВНОЙ ПАЙПЛАЙН (создаёт признаковую матрицу)
 # =============================================
 def run_pipeline(folder: str, model: str, api_key: str,
                  text_col: Optional[str] = None, id_col: Optional[str] = None,
@@ -340,12 +389,17 @@ def run_pipeline(folder: str, model: str, api_key: str,
     llm = CloudRuAdapter(api_key=api_key, model=model, timeout=timeout)
     os.makedirs(folder, exist_ok=True)
 
-    data = load_folder(folder_path=folder, text_col=text_col, id_col=id_col)
-    if not data:
-        return None, None, None
+    # Загружаем данные с сохранением всех колонок
+    records, full_df, text_col_name, id_col_name = load_folder_full(
+        folder_path=folder, text_col=text_col, id_col=id_col
+    )
+    
+    if not records:
+        return None, None, None, None
 
+    # Извлекаем пары для каждой записи
     all_pairs = []
-    for rec in data:
+    for rec in records:
         pairs = extract_pairs(rec['text'], llm, enable_thinking=enable_thinking)
         if not pairs:
             continue
@@ -356,32 +410,70 @@ def run_pipeline(folder: str, model: str, api_key: str,
                 'value': v,
                 'source': rec['source'],
                 'source_text': rec['text'],
-                'patient_id': rec.get('patient_id')
+                'patient_id': rec.get('patient_id'),
+                'row_num': rec.get('row_num')
             })
-    if not all_pairs:
-        return data, [], []
 
+    if not all_pairs:
+        return full_df, [], [], None
+
+    # Добавляем характеристики
     pair_list = [(p['term'], p['value']) for p in all_pairs]
     triples = enrich_with_characteristics(pair_list, llm, enable_thinking=enable_thinking)
 
-    # patient_id ПЕРВЫЙ
-    enriched = [{
-        'patient_id': p['patient_id'],
-        'term': t,
-        'characteristic': c,
-        'value': v,
-        'source': p['source'],
-        'source_text': p['source_text']
-    } for (t, c, v), p in zip(triples, all_pairs)]
+    # Создаём признаковую матрицу
+    # Группируем по patient_id (если есть) или по строке
+    if id_col_name and id_col_name in full_df.columns:
+        group_key = id_col_name
+    else:
+        # Если нет ID, группируем по индексу
+        full_df['_temp_row_id'] = range(len(full_df))
+        group_key = '_temp_row_id'
 
-    return data, all_pairs, enriched
+    # Собираем все уникальные термины с характеристиками
+    term_features = {}
+    for (t, c, v), p in zip(triples, all_pairs):
+        feature_name = f"{t}_{c}"
+        if feature_name not in term_features:
+            term_features[feature_name] = {}
+        # Сохраняем значение для конкретной строки
+        row_key = p.get('row_num') or p.get('source')
+        term_features[feature_name][row_key] = v
+
+    # Создаём DataFrame с признаками
+    feature_df = pd.DataFrame()
+    for feature_name, values in term_features.items():
+        feature_df[feature_name] = pd.Series(values)
+
+    # Объединяем с исходным DataFrame
+    result_df = full_df.copy()
+    
+    # Удаляем колонку с текстом (PropertyValue)
+    if text_col_name and text_col_name in result_df.columns:
+        result_df = result_df.drop(columns=[text_col_name])
+    
+    # Добавляем признаки
+    # Сопоставляем по строке
+    for feature_name in feature_df.columns:
+        # Создаём колонку в result_df, заполняя значения по source
+        result_df[feature_name] = None
+        for idx, row in result_df.iterrows():
+            # Ищем соответствующую запись в records
+            for rec in records:
+                if rec.get('row_num') == idx + 1:  # если row_num совпадает
+                    source_key = rec.get('row_num') or rec.get('source')
+                    if source_key in feature_df[feature_name].index:
+                        result_df.at[idx, feature_name] = feature_df[feature_name][source_key]
+                    break
+
+    return result_df, records, all_pairs, triples
 
 # =============================================
 # 9. STREAMLIT ИНТЕРФЕЙС
 # =============================================
 st.set_page_config(page_title="Медицинский парсер", layout="centered")
 st.title("🏥 Преобразование медицинских записей в датасет")
-st.markdown("Загрузите файлы (Excel, Word, TXT). Колонки определяются автоматически, но вы можете уточнить.")
+st.markdown("Загрузите файлы (Excel, Word, TXT). Исходная колонка с текстом будет заменена на извлечённые признаки.")
 
 # API-ключ
 if CLOUD_RU_API_KEY:
@@ -453,7 +545,7 @@ if st.button("Обработать"):
 
         with st.spinner("Идёт обработка... Это может занять несколько минут."):
             try:
-                data, all_pairs, enriched = run_pipeline(
+                result_df, records, all_pairs, triples = run_pipeline(
                     folder="input",
                     model="Qwen/Qwen3-30B-A3B",
                     api_key=api_key_input,
@@ -462,36 +554,25 @@ if st.button("Обработать"):
                     enable_thinking=enable_thinking
                 )
 
-                if data is None:
+                if result_df is None or result_df.empty:
                     st.error("Не удалось загрузить данные. Проверьте формат файлов.")
-                elif not all_pairs:
-                    st.warning("Не найдено ни одной пары (термин-значение). Возможно, текст не содержит медицинских терминов.")
                 else:
+                    # Сохраняем Excel
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        pd.DataFrame(data).to_excel(writer, sheet_name='Исходные записи', index=False)
-                        pd.DataFrame(all_pairs).to_excel(writer, sheet_name='Пары', index=False)
-                        pd.DataFrame(enriched).to_excel(writer, sheet_name='Итог', index=False)
-                        if enriched:
-                            char_dict = {r['value']: r['characteristic'] for r in enriched}
-                            pd.DataFrame(list(char_dict.items()), columns=['Значение', 'Характеристика']).to_excel(writer, sheet_name='Словарь характеристик', index=False)
+                        result_df.to_excel(writer, sheet_name='Результат', index=False)
+                        if all_pairs:
+                            pd.DataFrame(all_pairs).to_excel(writer, sheet_name='Извлеченные пары', index=False)
+                        if triples:
+                            pd.DataFrame(triples, columns=['Термин', 'Характеристика', 'Значение']).to_excel(writer, sheet_name='Тройки', index=False)
                     output.seek(0)
 
-                    st.success(f"Обработка завершена! Извлечено {len(enriched)} троек.")
+                    st.success(f"Обработка завершена! Исходная колонка заменена на {len(result_df.columns)} колонок-признаков.")
                     st.download_button(
-                        label="📥 Скачать result.xlsx",
+                        label="📥 Скачать результат.xlsx",
                         data=output,
-                        file_name="result.xlsx",
+                        file_name="результат.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    json_output = BytesIO()
-                    json_output.write(json.dumps(enriched, ensure_ascii=False, indent=2).encode('utf-8'))
-                    json_output.seek(0)
-                    st.download_button(
-                        label="📥 Скачать result.json",
-                        data=json_output,
-                        file_name="result.json",
-                        mime="application/json"
                     )
             except Exception as e:
                 st.error(f"Ошибка: {e}")
