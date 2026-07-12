@@ -206,7 +206,7 @@ def load_folder(folder_path: str, text_col: Optional[str] = None, id_col: Option
 # 5. АДАПТЕР ДЛЯ CLOUD.RU (с поддержкой thinking mode)
 # =============================================
 class CloudRuAdapter:
-    def __init__(self, model: str = "Qwen/Qwen3.5-9B", api_key: str = None, timeout: int = 300):
+    def __init__(self, model: str = "Qwen/Qwen3-30B-A3B", api_key: str = None, timeout: int = 300):
         self.model = model
         self.api_key = api_key
         if not self.api_key:
@@ -231,10 +231,8 @@ class CloudRuAdapter:
             "min_p": 0.0,
             "repetition_penalty": 1.0,
         }
-        
-        # Для Qwen3.5 используем reasoning_effort вместо chat_template_kwargs
         if not enable_thinking:
-            extra_body["reasoning_effort"] = "none"
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
         
         response = self.client.chat.completions.create(
             model=self.model,
