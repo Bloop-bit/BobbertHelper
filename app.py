@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import html as html_lib
 from typing import List, Dict, Optional
 from io import BytesIO
 
@@ -171,14 +172,103 @@ def read_txt(file_path: str) -> List[Dict]:
             })
     return records
 
+# =============================================
+# 4.1. ЧТЕНИЕ HTML (медицинские выгрузки DocA+ и др.)
+# =============================================
+def _decode_html_bytes(raw: bytes) -> str:
+    """Определяет кодировку по meta-тегу и декодирует байты."""
+    head = raw[:4000].decode('latin-1', errors='ignore')
+    m = re.search(r'charset\s*=\s*["\']?([\w\-]+)', head, re.IGNORECASE)
+    encodings = []
+    if m:
+        encodings.append(m.group(1).strip().lower())
+    encodings += ['utf-8', 'cp1251', 'windows-1251']
+    seen = set()
+    for enc in encodings:
+        if enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode('utf-8', errors='ignore')
+
+def _clean_html(html_text: str) -> str:
+    """Убирает теги/скрипты, заменяет структурные теги на переносы строк."""
+    # Скрипты и стили
+    html_text = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ',
+                       html_text, flags=re.DOTALL | re.IGNORECASE)
+    # Структурные теги → перевод строки
+    html_text = re.sub(
+        r'<\s*/?\s*(br|hr|p|tr|td|th|div|center|h[1-7]|li|table)[^>]*>',
+        '\n', html_text, flags=re.IGNORECASE
+    )
+    # Все остальные теги
+    html_text = re.sub(r'<[^>]+>', ' ', html_text)
+    # HTML-сущности
+    html_text = html_lib.unescape(html_text)
+    # Нормализация пробелов
+    lines = [re.sub(r'[ \t\xa0]+', ' ', line).strip()
+             for line in html_text.split('\n')]
+    lines = [l for l in lines if l]
+    return '\n'.join(lines)
+
+def read_html(file_path: str,
+              text_col: Optional[str] = None,
+              id_col: Optional[str] = None) -> List[Dict]:
+    """
+    Читает HTML-выгрузку. Делит документ на блоки по разделителям
+    <hr style="color:green;"> — каждая секция = одно исследование/консультация.
+    Извлекает ID пациента из 'Медицинская карта № ...' (если есть).
+    """
+    with open(file_path, 'rb') as f:
+        raw = f.read()
+    html_text = _decode_html_bytes(raw)
+
+    # ID пациента
+    pid_match = re.search(
+        r'Медицинск\w*\s+карт\w*\s*№\s*([\w\d/\-]+)',
+        html_text, re.IGNORECASE
+    )
+    patient_id = pid_match.group(1).strip() if pid_match else None
+
+    # Разбиение по зелёным hr; если их нет — берём весь документ
+    if re.search(r'<hr[^>]*color\s*:\s*green', html_text, re.IGNORECASE):
+        chunks = re.split(
+            r'<hr[^>]*color\s*:\s*green[^>]*>',
+            html_text, flags=re.IGNORECASE
+        )
+    else:
+        chunks = re.split(r'<hr[^>]*>', html_text, flags=re.IGNORECASE)
+
+    records = []
+    row_counter = 0
+    for chunk in chunks:
+        text = _clean_html(chunk)
+        # отсеиваем мусорные/пустые куски
+        if len(text) < 40:
+            continue
+        row_counter += 1
+        records.append({
+            'row_num': row_counter,
+            'text': text,
+            'source': f"{os.path.basename(file_path)}, блок {row_counter}",
+            'patient_id': patient_id,
+        })
+    return records
+
 def detect_file_type(file_path: str) -> Optional[str]:
     ext = os.path.splitext(file_path)[1].lower()
     if ext == '.docx': return 'docx'
     elif ext == '.xlsx': return 'xlsx'
-    elif ext == '.txt': return 'txt'
+    elif ext == '.txt':  return 'txt'
+    elif ext in ('.html', '.htm'): return 'html'
     return None
 
-def load_folder(folder_path: str, text_col: Optional[str] = None, id_col: Optional[str] = None) -> List[Dict]:
+def load_folder(folder_path: str,
+                text_col: Optional[str] = None,
+                id_col: Optional[str] = None) -> List[Dict]:
     os.makedirs(folder_path, exist_ok=True)
     all_records = []
     for filename in os.listdir(folder_path):
@@ -190,6 +280,9 @@ def load_folder(folder_path: str, text_col: Optional[str] = None, id_col: Option
             all_records.extend(read_xlsx(file_path, text_col, id_col))
         elif ft == 'txt':
             all_records.extend(read_txt(file_path))
+        elif ft == 'html':
+            # text_col/id_col для HTML не нужны
+            all_records.extend(read_html(file_path))
     return all_records
 
 # =============================================
@@ -246,7 +339,6 @@ def extract_pairs(text: str, llm) -> list:
     try:
         data = json.loads(content)
     except:
-        # Если JSON невалидный, пытаемся извлечь массив через регулярку
         match = re.search(r'\[.*\]', content, re.DOTALL)
         if match:
             try:
@@ -293,7 +385,7 @@ def enrich_with_characteristics(pairs: list, llm) -> list:
             if not char or len(char) > 100:
                 char = "характеристика"
             value_to_char[value] = char
-        except Exception as e:
+        except Exception:
             value_to_char[value] = "характеристика"
 
     triples = []
@@ -347,27 +439,23 @@ def run_pipeline(folder: str, model: str, api_key: str,
 # =============================================
 st.set_page_config(page_title="Медицинский парсер", layout="centered")
 st.title("🏥 Преобразование медицинских записей в датасет")
-st.markdown("Загрузите файлы (Excel, Word, TXT). Колонки определяются автоматически, но вы можете уточнить.")
+st.markdown("Загрузите файлы (Excel, Word, TXT, HTML). Колонки определяются автоматически, но вы можете уточнить.")
 
-# Ключ — если не найден в секретах, просим ввести
 if CLOUD_RU_API_KEY is None:
     api_key_input = st.text_input("Введите ваш API-ключ Cloud.ru", type="password")
 else:
     api_key_input = CLOUD_RU_API_KEY
     st.success("🔑 API-ключ загружен из секретов")
 
-# Загрузка файлов
 uploaded_files = st.file_uploader(
     "Выберите файлы",
     accept_multiple_files=True,
-    type=['xlsx', 'docx', 'txt']
+    type=['xlsx', 'docx', 'txt', 'html', 'htm']
 )
 
-# Переменные для ручного выбора колонок
 text_col = None
 id_col = None
 
-# Если загружены файлы, показываем выбор колонок для первого xlsx
 if uploaded_files:
     xlsx_files = [f for f in uploaded_files if f.name.endswith('.xlsx')]
     if xlsx_files:
@@ -398,14 +486,12 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Не удалось прочитать заголовки: {e}")
 
-# Кнопка запуска
 if st.button("Обработать"):
     if not api_key_input:
         st.error("Пожалуйста, введите API-ключ.")
     elif not uploaded_files:
         st.error("Загрузите хотя бы один файл.")
     else:
-        # Подготовка папки input
         input_dir = "input"
         os.makedirs(input_dir, exist_ok=True)
         for f in os.listdir(input_dir):
@@ -429,7 +515,6 @@ if st.button("Обработать"):
                 elif not all_pairs:
                     st.warning("Не найдено ни одной пары (термин-значение). Возможно, текст не содержит медицинских терминов.")
                 else:
-                    # Создаём Excel в памяти
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         pd.DataFrame(data).to_excel(writer, sheet_name='Исходные записи', index=False)
@@ -437,7 +522,9 @@ if st.button("Обработать"):
                         pd.DataFrame(enriched).to_excel(writer, sheet_name='Итог', index=False)
                         if enriched:
                             char_dict = {r['value']: r['characteristic'] for r in enriched}
-                            pd.DataFrame(list(char_dict.items()), columns=['Значение', 'Характеристика']).to_excel(writer, sheet_name='Словарь характеристик', index=False)
+                            pd.DataFrame(list(char_dict.items()),
+                                         columns=['Значение', 'Характеристика']
+                                         ).to_excel(writer, sheet_name='Словарь характеристик', index=False)
                     output.seek(0)
 
                     st.success(f"Обработка завершена! Извлечено {len(enriched)} троек.")
