@@ -1,0 +1,18 @@
+Этап: {stage}
+Требуемые поля в элементах: {expected_fields}
+
+Список A (модель A):
+{list_a}
+
+Список B (модель B):
+{list_b}
+
+Сравни и выдай JSON:
+{{
+  "agreed":  [элементы с полями {expected_fields}],
+  "only_a":  [элементы с полями {expected_fields}],
+  "only_b":  [элементы с полями {expected_fields}]
+}}
+
+ВАЖНО: каждый элемент должен содержать ВСЕ поля из списка {expected_fields}.
+Не пропускай элементы из A или B — они должны попасть в agreed, only_a или only_b.
