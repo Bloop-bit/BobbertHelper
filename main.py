@@ -1,6 +1,3 @@
-"""
-Извлечение триплетов + финальная сборка таблицы силами LLM (Арбитра).
-"""
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +19,7 @@ from openpyxl import Workbook
 # ============================================================
 
 def pick_file() -> str | None:
+    # Нужно только для локального запуска
     if len(sys.argv) > 1:
         p = sys.argv[1]
         if Path(p).is_file():
@@ -87,7 +85,7 @@ def _read_xlsx(p: Path) -> list[tuple[str, str]]:
             name_idx = i
 
     if text_idx is None:
-        raise ValueError("Не найдена колонка с текстом")
+        raise ValueError("Не найдена колонка с текстом (PropertyValue/text/value)")
 
     by_id: dict[str, list[str]] = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -116,6 +114,8 @@ def load_file(path: str) -> list[tuple[str, str]]:
 # ============================================================
 
 def load_keys(path: str = "keys.txt") -> dict:
+    # Для локального запуска. В Streamlit ключи берутся из st.secrets.
+    if not Path(path).exists(): return {}
     cfg = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -132,7 +132,7 @@ def load_prompts(folder: str = "prompts") -> dict:
         "s1_sys": r("stage1_system"), "s1_usr": r("stage1_user"),
         "s2_sys": r("stage2_system"), "s2_usr": r("stage2_user"),
         "align_sys": r("align_system"), "align_usr": r("align_user"),
-        "table_sys": r("table_system"), "table_usr": r("table_user"), # Новые промпты
+        "table_sys": r("table_system"), "table_usr": r("table_user"),
     }
 
 
@@ -376,12 +376,8 @@ async def synthesize_table(record_id: str, triplets: list[dict], model: LLMClien
     
     data = _load_json(raw)
     if isinstance(data, dict):
-        # Ожидаем, что LLM вернет {"feature1": "value", "feature2": "value"}
-        # или {"data": {...}}
         if "data" in data and isinstance(data["data"], dict):
             return data["data"], call
-        
-        # Если это просто словарь, фильтруем системные ключи
         clean = {k: str(v) for k, v in data.items() if not k.startswith("_")}
         return clean, call
         
@@ -389,26 +385,23 @@ async def synthesize_table(record_id: str, triplets: list[dict], model: LLMClien
 
 
 # ============================================================
-#                    СОХРАНЕНИЕ В EXCEL
+#                    СОХРАНЕНИЕ В EXCEL (Все 4 листа)
 # ============================================================
 
 def save_excel(path: str, results: list[dict]):
     wb = Workbook()
     
-    # 1. Собираем все уникальные колонки из всех синтезированных словарей
+    # 1. Собираем все уникальные колонки
     all_columns = set()
     for r in results:
         table_data = r.get("table_data", {})
         all_columns.update(table_data.keys())
-    
-    # Сортируем для красоты
     columns = sorted(list(all_columns))
     
     # 2. Лист "Датасет"
     ws1 = wb.active
     ws1.title = "Датасет"
     ws1.append(["record_id"] + columns)
-    
     for r in results:
         row = [r["record_id"]]
         table_data = r.get("table_data", {})
@@ -416,7 +409,7 @@ def save_excel(path: str, results: list[dict]):
             row.append(table_data.get(col, ""))
         ws1.append(row)
 
-    # 3. Лист "Все_триплеты" (исходники)
+    # 3. Лист "Все_триплеты"
     ws2 = wb.create_sheet("Все_триплеты")
     ws2.append(["record_id", "Термин", "Характеристика", "Значение"])
     for r in results:
@@ -431,23 +424,29 @@ def save_excel(path: str, results: list[dict]):
             ws3.append([r["record_id"], d.get("stage"), d.get("kind"), d.get("model_a"), d.get("model_b"),
                         d.get("item_a"), d.get("item_b"), d.get("key")])
 
+    # 5. Лист "Аудит"
+    ws4 = wb.create_sheet("Аудит")
+    ws4.append(["record_id", "Этап", "Модель", "Промпт", "Ответ", "Ошибка", "Время"])
+    for r in results:
+        for c in r["result"]["calls"]:
+            ws4.append([c.record_id, c.stage, c.model, c.prompt[:1000], c.raw[:1000], c.error or "", c.timestamp.isoformat()])
+
     wb.save(path)
 
 
 # ============================================================
-#                        MAIN
+#                        ЛОКАЛЬНЫЙ MAIN (Для запуска без Streamlit)
 # ============================================================
 
 async def main():
     print("=" * 60)
-    print("  Извлечение и финальная сборка таблицы (LLM Synthesis)")
+    print("  Извлечение и финальная сборка таблицы (Local Run)")
     print("=" * 60)
 
     path = pick_file()
     if not path:
         print("Файл не выбран.")
         return
-    print(f"Файл: {path}")
 
     cfg = load_keys("keys.txt")
     prompts = load_prompts("prompts")
@@ -459,51 +458,23 @@ async def main():
 
     model_a = make_client(cfg["MODEL_A"])
     model_b = make_client(cfg["MODEL_B"])
-    
-    # Арбитр обязателен для финального синтеза
-    arb_name = cfg.get("ARBITER_MODEL", cfg["MODEL_A"]).strip()
-    arbiter = make_client(arb_name)
-
-    print(f"Модель A: {model_a.name}")
-    print(f"Модель B: {model_b.name}")
-    print(f"Сборщик:  {arbiter.name}\n")
+    arbiter = make_client(cfg.get("ARBITER_MODEL", cfg["MODEL_A"]))
 
     records = load_file(path)
     print(f"Записей: {len(records)}\n")
 
     all_results = []
-    
-    # Обрабатываем записи параллельно для скорости
-    sem = asyncio.Semaphore(3) # Не более 3 записей одновременно
+    for i, (rid, text) in enumerate(records, 1):
+        print(f"[{i}/{len(records)}] {rid}...")
+        res = await process_text(rid, text, model_a, model_b, arbiter, prompts)
+        table_data, synth_call = await synthesize_table(rid, res["triplets"], arbiter, prompts)
+        res["calls"].append(synth_call)
+        all_results.append({"record_id": rid, "result": res, "table_data": table_data})
 
-    async def process_record(i, rid, text):
-        async with sem:
-            print(f"[{i}/{len(records)}] Извлечение для {rid}...")
-            # Шаг 1 и 2 (Триплеты)
-            res = await process_text(rid, text, model_a, model_b, arbiter, prompts)
-            
-            print(f"[{i}/{len(records)}] Синтез таблицы для {rid}...")
-            # Шаг 3 (Синтез)
-            table_data, synth_call = await synthesize_table(rid, res["triplets"], arbiter, prompts)
-            res["calls"].append(synth_call)
-            
-            return {"record_id": rid, "result": res, "table_data": table_data}
-
-    tasks = [process_record(i, rid, text) for i, (rid, text) in enumerate(records, 1)]
-    all_results = await asyncio.gather(*tasks)
-
-    # --- СОХРАНЕНИЕ ---
     src = Path(path)
     out = src.parent / f"{src.stem}_synthesized.xlsx"
     save_excel(str(out), all_results)
     print(f"\nСохранено: {out}")
-
-    try:
-        import os
-        os.startfile(str(out))
-    except Exception:
-        pass
-
 
 if __name__ == "__main__":
     asyncio.run(main())
