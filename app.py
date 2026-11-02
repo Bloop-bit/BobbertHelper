@@ -4,7 +4,10 @@ import os
 from pathlib import Path
 from io import BytesIO
 import pandas as pd
-
+import os
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
+os.environ['NO_PROXY'] = '*'
 from main import process_text, synthesize_table, load_prompts, LLMClient, load_file, save_excel
 
 st.set_page_config(page_title="Извлечение данных из ЭМК", page_icon="🏥", layout="wide")
