@@ -5,10 +5,8 @@ from pathlib import Path
 from io import BytesIO
 import pandas as pd
 
-# Импортируем наши функции из main.py
-from main import process_text, synthesize_table, load_prompts, LLMClient
+from main import process_text, synthesize_table, load_prompts, LLMClient, load_file, save_excel
 
-# Настройка страницы
 st.set_page_config(page_title="Извлечение данных из ЭМК", page_icon="🏥", layout="wide")
 
 st.title("🏥 Извлечение структурированных данных из клинических текстов")
@@ -21,22 +19,19 @@ st.markdown("""
 """)
 
 # Загружаем ключи из настроек Streamlit
-# (Об этом ниже, в инструкции по деплою)
 try:
     API_KEY = st.secrets["API_KEY"]
     BASE_URL = st.secrets["BASE_URL"]
     MODEL_A = st.secrets["MODEL_A"]
     MODEL_B = st.secrets["MODEL_B"]
     ARBITER_MODEL = st.secrets["ARBITER_MODEL"]
-except KeyError:
-    st.error("Ошибка: не настроены API-ключи. Добавьте их в настройки Streamlit.")
+except KeyError as e:
+    st.error(f"Ошибка: не настроены API-ключи в Secrets. Отсутствует {e}")
     st.stop()
 
-# Загрузка файла
 uploaded_file = st.file_uploader("Выберите файл с данными", type=["xlsx", "docx", "html", "txt"])
 
 if uploaded_file is not None:
-    # Сохраняем загруженный файл во временную папку
     temp_dir = Path("temp_uploads")
     temp_dir.mkdir(exist_ok=True)
     file_path = temp_dir / uploaded_file.name
@@ -46,11 +41,9 @@ if uploaded_file is not None:
     if st.button("🚀 Запустить обработку"):
         st.info("Обработка запущена. Пожалуйста, не закрывайте страницу.")
         
-        # Прогресс-бар
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        # Инициализация моделей
         def make_client(name):
             return LLMClient(name=name, api_key=API_KEY, base_url=BASE_URL,
                              max_tokens=8192, temperature=0.1)
@@ -61,14 +54,11 @@ if uploaded_file is not None:
         
         prompts = load_prompts("prompts")
         
-        # Запуск асинхронного пайплайна
         async def run_pipeline():
-            # В main.py у вас есть функция load_file, которая возвращает список (id, text)
-            from main import load_file
             records = load_file(str(file_path))
-            
             results = []
             total = len(records)
+            api_errors = []
             
             for i, (rid, text) in enumerate(records, 1):
                 status_text.text(f"Обработка записи {rid} ({i} из {total})...")
@@ -76,28 +66,38 @@ if uploaded_file is not None:
                 # Шаг 1 и 2: Извлечение
                 res = await process_text(rid, text, model_a, model_b, arbiter, prompts)
                 
+                # Проверяем, были ли ошибки API
+                for call in res["calls"]:
+                    if call.error:
+                        api_errors.append(f"Запись {rid} ({call.stage}, модель {call.model}): {call.error}")
+                
                 # Шаг 3: Синтез
                 table_data, synth_call = await synthesize_table(rid, res["triplets"], arbiter, prompts)
+                if synth_call.error:
+                     api_errors.append(f"Запись {rid} (синтез): {synth_call.error}")
+                     
                 res["calls"].append(synth_call)
-                
                 results.append({"record_id": rid, "result": res, "table_data": table_data})
-                
                 progress_bar.progress(i / total)
                 
-            return results
+            return results, api_errors
 
-        # Запускаем асинхронный код в Streamlit
         try:
-            all_results = asyncio.run(run_pipeline())
+            all_results, api_errors = asyncio.run(run_pipeline())
             
-            # Формируем итоговый Excel в памяти
-            from main import save_excel
+            # Показываем ошибки, если они были
+            if api_errors:
+                st.error("⚠️ Во время работы возникли ошибки (возможно, неверный API-ключ или закончился баланс):")
+                for err in api_errors[:5]: # Показываем первые 5 ошибок
+                    st.code(err)
+                if len(api_errors) > 5:
+                    st.write(f"... и еще {len(api_errors) - 5} ошибок.")
+            
             out_path = temp_dir / f"processed_{uploaded_file.name}"
             save_excel(str(out_path), all_results)
             
             st.success("✅ Обработка завершена!")
             
-            # Кнопка скачивания
             with open(out_path, "rb") as f:
                 st.download_button(
                     label="📥 Скачать готовый Excel",
@@ -106,13 +106,7 @@ if uploaded_file is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             
-            # Предпросмотр таблицы
             st.subheader("Предпросмотр результата")
-            # Собираем все колонки
-            all_cols = set()
-            for r in all_results:
-                all_cols.update(r.get("table_data", {}).keys())
-            
             df_data = []
             for r in all_results:
                 row = {"record_id": r["record_id"]}
@@ -123,4 +117,4 @@ if uploaded_file is not None:
             st.dataframe(df)
             
         except Exception as e:
-            st.error(f"Произошла ошибка: {e}")
+            st.error(f"Критическая ошибка приложения: {e}")
